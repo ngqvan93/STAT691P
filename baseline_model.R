@@ -1,4 +1,4 @@
-# Authors: Emma Kearney, Van Nguyen
+# Authors: Van Nguyen, Emma Kearney
 
 
 # Load needed libraries

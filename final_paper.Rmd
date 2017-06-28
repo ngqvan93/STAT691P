@@ -1,0 +1,694 @@
+---
+title: 'Stat 691P: Final Report'
+author: "Dana Udwin, Deirdre Fitzpatrick, Emma Kearney, Van Nguyen"
+date: "May 11, 2017"
+output: pdf_document
+---
+
+```{r echo=F, warning=F, message=F}
+require(lme4)
+require(gstat)
+require(sp)
+require(knitr)
+library(raster)
+library(leaflet)
+require(dplyr)
+
+set.seed(99)
+
+# Load in data
+
+#setwd('/Users/mm87597/Documents/Classes/Stat_697P')
+#setwd('/Users/mm87717/Documents/STAT691P')
+#setwd('/Users/Dana/Documents/STAT691P')
+#setwd("C:/Users/Emma/Google Drive/Spring17/Proj_course/")
+setwd('/Users/VanNguyen/Desktop/STAT691P')
+load("Boston.RData")
+colnames(Boston.data) <- c("Address", "Town", "Rent", "Bedrooms", "SqFt",
+                           "Apt.or.House", "Utilities.Included", 
+                           "Latitude", "Longitude", "Zipcode",
+                           "State", "Num.Bedrooms")
+data <- Boston.data
+
+# Clean data
+
+# Bedrooms is redundant with num.bedrooms
+# We also don't need State (4 cases NH, else MA)
+# Make zipcode a factor
+data <- data %>% 
+  dplyr::select(-Bedrooms, -State) %>% 
+  mutate(Zipcode = factor(Zipcode))
+
+# Where 'S', make 0
+data <- data %>% 
+  mutate(Num.Bedrooms = as.character(Num.Bedrooms))
+data[which(data$Num.Bedrooms == 'S'), 'Num.Bedrooms'] <- 0
+data <- data %>% 
+  mutate(Num.Bedrooms = as.numeric(Num.Bedrooms))
+
+data <- data[complete.cases(data),]
+
+data <- data %>% filter(SqFt > 0)
+
+top.towns <- data %>% 
+group_by(Town) %>% 
+summarize(count = n()) %>% 
+arrange(desc(count))
+
+top3 <- as.vector(top.towns$Town[1:5])
+
+data <- data %>% 
+mutate(Town = ifelse(as.vector(Town) %in% top3 , as.vector(Town), "Other"))
+
+data$Town <- as.factor(data$Town)
+data$Zipcode <- as.factor(data$Zipcode)
+```
+
+```{r echo=F, warning=F, message=F}
+# Create training and test splits
+# We don't want to "cheat" by limiting test set to only homes with multiple units 
+# (so that they'd appear in training set)
+
+# HOWEVER- going to get a little fudgy by making sure our plain old fixed effect zip 
+# appears in both sets
+
+get_train_test_split <- function(data) {
+  train <- sample_n(data, size=floor(nrow(data) * .7), replace=FALSE)
+  test <- data[setdiff(rownames(data), rownames(train)), ]
+  test.only.zips <- setdiff(unique(test$Zipcode), unique(train$Zipcode)) # 02109
+  for (zip in test.only.zips) {
+    zip.sub <- test[which(test$Zipcode == zip), ]
+    add.to.train <- sample_n(zip.sub, 
+                             ceiling(nrow(zip.sub) * 0.5), 
+                             replace=FALSE)
+    train <- bind_rows(train, add.to.train)
+    test <- test[-which(rownames(test) %in% rownames(add.to.train)), ]
+  }
+  return(list('train'=train, 'test'=test))
+}
+
+train_test_split <- get_train_test_split(data)
+train <- train_test_split$train
+test <- train_test_split$test
+```
+
+```{r echo=F, warning=F, message=F}
+# Fit baseline
+
+null <- lm(Rent ~ 1, data = train)
+full <- lm(Rent ~ . - Address, data = train)
+
+baseline.model <- step(null, scope=list(lower=null, upper=full),
+                       direction='both', trace = FALSE)
+
+# Evaluation baseline
+predictions <- predict(baseline.model, test)
+baseline.rmse <- sqrt(mean((test$Rent - predictions)^2))
+baseline.aic <- round(AIC(baseline.model), 1)
+baseline.sigma <- round(summary(baseline.model)$sigma, 1)
+```
+
+```{r echo=F, warning=F, message=F}
+# Fit linear mixed effect model with random intercept as Address
+# Swap out Town for Zipcode as fixed effect (as factor)
+
+mixed.model <- lmer(Rent ~ 
+                      Num.Bedrooms + 
+                      Zipcode + 
+                      Apt.or.House + 
+                      # Longitude + 
+                      Utilities.Included + 
+                      SqFt +  
+                      (1 | Address), 
+  data = train, REML = TRUE)
+
+# Evaluate
+test.predictions <- predict(mixed.model, newdata=test,
+                                allow.new.levels=TRUE)
+mixed.rmse <- sqrt(mean((test$Rent - test.predictions)^2))
+mixed.aic <- round(AIC(mixed.model), 1)
+mixed.sigma <- summary(mixed.model)$sigma
+```
+
+```{r echo=F, warning=F, message=F}
+# Linear mixed effect model with Random Slope
+# Random intercept is address, random slope is Num.Bedrooms (as numeric)
+# Dedepending on the intercept, the coefficient on Num.Bedrooms will change
+mixed.model.slopes <- lmer(Rent ~
+                      Num.Bedrooms +
+                      Zipcode +
+                      Apt.or.House +
+                      # Longitude +
+                      Utilities.Included +
+                      SqFt +
+                       (1 + Num.Bedrooms | Address),
+  data = train, REML = TRUE)
+
+# Evaluate 
+test.predictions.slopes <- predict(mixed.model.slopes, newdata = test, 
+                                   allow.new.levels=TRUE)
+mixed.slopes.rmse <- sqrt(mean((test$Rent - test.predictions.slopes)^2))
+mixed.slopes.aic <- round(AIC(mixed.model.slopes), 1)
+mixed.slopes.sigma <- summary(mixed.model.slopes)$sigma
+```
+
+```{r echo=F, warning=F, message=F}
+# Nested Model
+
+model.nested <- lmer(Rent ~ 
+                      Num.Bedrooms + 
+                      Apt.or.House + 
+                      # Longitude + 
+                      Utilities.Included + 
+                      SqFt + 
+                      (1|Zipcode/Address), 
+  data = train, REML = TRUE)
+
+# Evaluate
+test.predictions.nested<- predict(model.nested, newdata = test, allow.new.levels=TRUE)
+nested.rmse <- sqrt(mean((test$Rent - test.predictions.nested)^2))
+nested.aic <- round(AIC(model.nested), 1)
+nested.sigma <- summary(model.nested)$sigma
+```
+
+```{r echo=F, warning=F, message=F, include=F}
+predict_krig <- function(train, test, fit) {
+  dedupe.test <- test %>%
+    mutate(Longitude=jitter(Longitude), Latitude=jitter(Latitude)) %>%
+    as.data.frame()
+  krig.test <- SpatialPixelsDataFrame(points = dedupe.test[c("Longitude", "Latitude")],
+                                      data = dedupe.test,
+                                      tolerance=0.995623)
+  gridded(krig.test) <- TRUE
+
+  # test
+  kriged.rent <- krige(log(Rent) ~ Num.Bedrooms +
+                         Apt.or.House +
+                         Utilities.Included +
+                         SqFt,
+                       train, krig.test, model=fit)
+
+  pred.mat <- kriged.rent$var1.pred
+  # Evaluate
+  krig.predictions <- exp(pred.mat)
+  return(list('predictions'=krig.predictions, 'test_data'=dedupe.test))
+}
+```
+
+```{r echo=F, warning=F, message=F, include=F}
+# Kriging
+
+# Idea here is to do `num.iter` iterations of kriging
+# For each iteration, we grab a new (hopefully different, but it's random)
+#     unit from training set to represent an address
+# Every address in training set is always represented by 1 single unit
+
+dedupe.train <- train %>%
+  mutate(Longitude=jitter(Longitude), Latitude=jitter(Latitude)) %>%
+  as.data.frame()
+krig.train <- dedupe.train
+coordinates(krig.train) <- ~ Longitude + Latitude
+
+# fit
+varigram.rent <- variogram(log(Rent) ~ Num.Bedrooms +
+                                 Apt.or.House +
+                                 Utilities.Included +
+                                 SqFt,
+                               krig.train)
+fit.rent <- fit.variogram(varigram.rent, model=vgm("Sph"))
+
+
+# Evaluate
+krig.predictions_info <- predict_krig(train=krig.train, test=test, fit=fit.rent)
+krig.predictions <- krig.predictions_info$predictions
+dedupe.test <- krig.predictions_info$test_data
+krig.rmse <- sqrt(mean((dedupe.test$Rent - krig.predictions)^2))
+krig.sigma <- sd(dedupe.test$Rent - krig.predictions)
+```
+
+```{r echo=F}
+# Present findings
+
+metrics.dat <- data.frame(baseline = c(baseline.aic, baseline.rmse, baseline.sigma),
+                          lme.intercept = c(mixed.aic, mixed.rmse, mixed.sigma),
+                          lme.slope = c(mixed.slopes.aic, mixed.slopes.rmse, mixed.slopes.sigma),
+                          nested = c(nested.aic, nested.rmse, nested.sigma),
+                          kriging = c(NA, krig.rmse, krig.sigma),
+                          row.names=c('AIC', 'RMSE', 'Sigma'))
+```
+
+
+```{r echo=F, warning=F, message=F}
+# Reduce to downtown area
+
+# copley square 42.3483N 71.0786W
+copley <- c(42.3483, -71.0786)
+
+# input: row index
+# output: distance in km (as crow flies, approx) to copley square
+get_euclidean_dist <- function(row) {
+  # print(row)
+
+  lat <- data$Latitude[row]
+  lon <- data$Longitude[row]
+
+  dist.degrees <- sqrt((copley[1] - lat)^2 + (copley[2] - lon)^2)
+  dist.miles <- dist.degrees * 69 # very approximate
+
+  return(dist.miles)
+}
+
+distances <- sapply(1:nrow(data), function(row)
+  get_euclidean_dist(row))
+
+# Keep points within 4 miles from Copley
+data_bos <- data[distances <= 7, ]
+```
+
+```{r echo=F, warning=F, message=F}
+# Create training and test splits
+# We don't want to "cheat" by limiting test set to only homes with multiple units
+# (so that they'd appear in training set)
+
+train_test_split_bos <- get_train_test_split(data_bos)
+train_bos <- train_test_split_bos$train
+test_bos <- train_test_split_bos$test
+```
+
+```{r echo=F, warning=F, message=F}
+# Fit baseline
+
+null_bos <- lm(Rent ~ 1, data = train_bos)
+full_bos <- lm(Rent ~ . - Address, data = train_bos)
+
+baseline.model_bos <- step(null_bos, scope=list(lower=null_bos, upper=full_bos),
+direction='both', trace = FALSE)
+
+# Evaluation baseline
+predictions_bos <- predict(baseline.model_bos, test_bos)
+baseline.rmse_bos <- sqrt(mean((test_bos$Rent - predictions_bos)^2))
+baseline.aic_bos <- round(AIC(baseline.model_bos), 1)
+baseline.sigma_bos <- round(summary(baseline.model_bos)$sigma, 1)
+```
+
+```{r echo=F, warning=F, message=F}
+# Fit linear mixed effect model with random intercept
+# Add zip as fixed effect
+
+new.mixed.model_bos <- lmer(Rent ~
+                      Num.Bedrooms +
+                      Zipcode +
+                      Apt.or.House +
+                      # Longitude +
+                      Utilities.Included +
+                      SqFt +
+                      (1 | Address),
+  data = train_bos, REML = TRUE)
+
+# Evaluate
+new.test.predictions_bos <- predict(new.mixed.model_bos, newdata=test_bos,
+                                allow.new.levels=TRUE)
+new.mixed.rmse_bos <- sqrt(mean((test_bos$Rent - new.test.predictions_bos)^2))
+new.mixed.aic_bos <- round(AIC(new.mixed.model_bos), 1)
+new.mixed.sigma_bos <- summary(new.mixed.model_bos)$sigma
+```
+
+```{r echo=F, warning=F, message=F}
+# Linear mixed effect model with Random Slope
+# Random intercept is address, random slope is num.bedrooms
+# Dedepending on the intercept, the coefficient on num.bedrooms will change
+mixed.model.slopes_bos <- lmer(Rent ~
+                      Num.Bedrooms +
+                      Zipcode +
+                      Apt.or.House +
+                      # Longitude +
+                      Utilities.Included +
+                      SqFt +
+                       (1 + Num.Bedrooms | Address),
+  data = train_bos, REML = TRUE)
+
+# Evaluate
+test.predictions.slopes_bos <- predict(mixed.model.slopes_bos, newdata = test_bos,
+                                   allow.new.levels=TRUE)
+mixed.slopes.rmse_bos <- sqrt(mean((test_bos$Rent - test.predictions.slopes_bos)^2))
+mixed.slopes.aic_bos <- round(AIC(mixed.model.slopes_bos), 1)
+mixed.slopes.sigma_bos <- summary(mixed.model.slopes_bos)$sigma
+```
+
+```{r echo=F, warning=F, message=F}
+# Nested Model
+
+model.nested_bos <- lmer(Rent ~
+                      Num.Bedrooms +
+                      Apt.or.House +
+                      # Longitude +
+                      Utilities.Included +
+                      SqFt +
+                      (1|Zipcode/Address),
+  data = train_bos, REML = TRUE)
+
+# Evaluate
+test.predictions.nested_bos <- predict(model.nested_bos, newdata = test_bos, allow.new.levels=TRUE)
+nested.rmse_bos <- sqrt(mean((test_bos$Rent - test.predictions.nested_bos)^2))
+nested.aic_bos <- round(AIC(model.nested_bos), 1)
+nested.sigma_bos <- summary(model.nested_bos)$sigma
+```
+
+```{r echo=F, warning=F, message=F, include=F}
+# Kriging
+
+# Idea here is to do `num.iter` iterations of kriging
+# For each iteration, we grab a new (hopefully different, but it's random)
+#     unit from training set to represent an address
+# Every address in training set is always represented by 1 single unit
+
+dedupe.train_bos <- train_bos %>%
+  mutate(Longitude=jitter(Longitude), Latitude=jitter(Latitude)) %>%
+  as.data.frame()
+krig.train_bos <- dedupe.train_bos
+coordinates(krig.train_bos) <- ~ Longitude + Latitude
+
+# fit
+varigram.rent_bos <- variogram(log(Rent) ~ Num.Bedrooms +
+                                 Apt.or.House +
+                                 Utilities.Included +
+                                 SqFt,
+                               krig.train_bos)
+fit.rent_bos <- fit.variogram(varigram.rent_bos, model=vgm("Sph"))
+
+
+# Evaluate
+krig.predictions_info_bos <- predict_krig(train=krig.train_bos, test=test_bos, fit=fit.rent_bos)
+krig.predictions_bos <- krig.predictions_info_bos$predictions
+dedupe.test_bos <- krig.predictions_info_bos$test_data
+krig.rmse_bos <- sqrt(mean((dedupe.test_bos$Rent - krig.predictions_bos)^2))
+krig.sigma_bos <- sd(dedupe.test_bos$Rent - krig.predictions_bos)
+```
+
+```{r echo=F, warning=F, message=F, include=F}
+# # Present findings
+#
+metrics.dat_bos <- data.frame(baseline = c(baseline.aic_bos, baseline.rmse_bos, baseline.sigma_bos),
+                          lme.intercept = c(new.mixed.aic_bos, new.mixed.rmse_bos, new.mixed.sigma_bos),
+                          lme.slope = c(mixed.slopes.aic_bos, mixed.slopes.rmse_bos, mixed.slopes.sigma_bos),
+                          nested = c(nested.aic_bos, nested.rmse_bos, nested.sigma_bos),
+                          kriging = c(NA, krig.rmse_bos, krig.sigma_bos),
+                          row.names=c('AIC', 'RMSE', 'Sigma'))
+```
+
+# Introduction #
+
+Finding an affordable apartment in Boston and the surrounding area can be difficult for anyone. What if we could make this process easier by building a model that helps to predict rental prices in that area? In this paper, we explore modeling of rental prices based on apartment amenities as well as location. We aim to build a model with high predictive power that could enable someone looking for an apartment to know more about where to look, which amenities they may be able to afford, and which apartments may be excellent deals or which may be overpriced. A real estate agent might also find such a tool helpful for addresses or neighborhoods they haven't yet worked in, but would like to.
+
+# Data #
+
+The data used in this exploration was gathered from \hyperlink{rentals.com}{rentals.com}, by searching for Boston, MA and retrieving all listings that were returned.  We first obtained a list of 'href' tags, each of which is a unique ID for a rental property's webpage. This was done using the `rvest` package and the SelectorGadget Chrome Extension.  For each listing (i.e. for each href), we scraped information on address, town, zip code, state, latitude and longitude, rental price, number of bedrooms, square footage, whether the listing was for an apartment or a house, and whether or not utilities were included in the price.  Each row in the final dataset represents one rental unit, regardless of whether or not it is in a complex. Therefore, if a complex has multiple open units, it would be represented as multiple rows in the dataset. The first few entries in the data set are listed in the code appendix. 
+ 
+
+Below are the distributions of each variable used in modeling, including rental price which we will be attempting predict.
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+library(ggplot2)
+ggplot(data=data, aes(x=Rent)) + 
+  geom_histogram() + 
+  ylab('Count')
+ggplot(data=data, aes(x=Town)) +
+  geom_bar() +
+  ylab('Count') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Num.Bedrooms)) + 
+  geom_histogram() + 
+  ylab('Count') + 
+  xlab('Number of Bedrooms')
+ggplot(data=data, aes(x=SqFt)) + 
+  geom_histogram() + 
+  ylab('Count') + 
+  xlab('Rental Unit Square Footage')
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Latitude)) + 
+  geom_histogram() + 
+  ylab('Count') + 
+  xlab('Latitude')
+ggplot(data=data, aes(x=Longitude)) + 
+  geom_histogram() + 
+  ylab('Count') + 
+  xlab('Longitude')
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Apt.or.House)) + 
+  geom_bar() + 
+  ylab('Count') + 
+  xlab('Apartment or House?')
+ggplot(data=data, aes(x=Utilities.Included)) + 
+  geom_bar() + 
+  ylab('Count') + 
+  xlab('Utilities Included?')
+```
+
+Below are the distributions of rent in relation to each of the variables that we will use to model.
+
+```{r echo=FALSE, fig.height=3, fig.width=6, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Town, y=Rent)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Num.Bedrooms, y=Rent)) + 
+  geom_point() + 
+  xlab('Number of Bedrooms')
+ggplot(data=data, aes(x=SqFt, y=Rent)) + 
+  geom_point() + 
+  xlab('Rental Unit Square Footage')
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Latitude, y=Rent)) + 
+  geom_point() + 
+  xlab('Latitude')
+ggplot(data=data, aes(x=Longitude, y=Rent)) + 
+  geom_point() + 
+  xlab('Longitude')
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=3, warning=FALSE, message=FALSE}
+ggplot(data=data, aes(x=Utilities.Included, y=Rent)) + 
+  geom_boxplot() + 
+  xlab('Utilities Included?')
+ggplot(data=data, aes(x=Apt.or.House, y=Rent)) + 
+  geom_boxplot() + 
+  xlab('Apartment or House?')
+```
+
+# Statistical Methods #
+
+## Train/Test Split ##
+
+We attempt modeling on two subsets of data: all of the data collected for the Boston area and then only those places within a seven mile radius of Copley Square. For the full dataset, we use a training and testing split of 70% and 30% for validation. For those closest to Copley Square, we use 80% for training and 20% for testing, since it is sigmnificantly less data.
+
+## Linear Model ##
+
+For our preliminary modeling method, we chose to use linear regression. Our chosen baseline model is of the form:
+
+\begin{equation}
+Rent = \beta_0 + \beta_1 X_1 + ... + \beta_k X_k + \epsilon,
+\end{equation}
+
+Here, the $\beta$s are the coefficents fit by the model and the $X$s are our predictors. The predictors we used for this model are: square footage, whether a listing is for an apartment or a house, zip code, whether utilities are included, and number of bedrooms. To find this subset of predictors, we used stepwise regression in both directions.
+
+## Mixed Effects Modeling ##
+
+Next, we experiment with mixed effects modeling techniques, including random intercept, random slope with a random intercept, and nested model approaches. We use the same fixed effects predictors as we did in our linear model, but add additional random effects. This dataset naturally lends itself to linear mixed effects because a desirable address may account for its multiple units' unilaterally high cost.
+
+We first introduce an `Address` random intercept. This allows every rental property in the data set to have its own baseline rental price determined by that unit's address. The random intercept model follows the form:
+
+$$ Y_{ij} = \mathbf{X_{ij}}\beta + b_{i} + \epsilon_{ij}$$
+Where $i$ indexes unique addresses, and $j$ indexes units within addresses. Rent ($Y_{ij}$) is indexed by both, while the model's intercept term is indexed only by address ($b_{i}$). Note $b_{i} \sim N(0, \sigma_{b}^{2})$ and $\epsilon_{ij} \sim N(0, \sigma_{\epsilon}^{2})$. 
+
+It is intuitive that the location and type of neighborhood encompassed by `Address` would set rent higher or lower for a unit regardless of other (fixed) predictor variables. Compared with the baseline model, our random intercept model accounts for address-to-address variance ($b_{i}$) as well as within-address variance ($\epsilon_{ij}$). The error term now only describes within-address variation, whereas the baseline model's error term was a catch-all for within- and between-address variation. Therefore, we remidiate non-independant error terms (as shown in plots above) by introducing the random intercept.
+
+Next, we explore a mixed effect model containing both a random intercept and random slope term: 
+
+$$ Y_{ij} = \mathbf{X_{ij}}\beta + \mathbf{Z_{i}} b_{i}  + \epsilon_{ij}$$
+This is the same as the random intercept model, except now we have a $Z_{i}$ model matrix for the random effects. In the intercept-only model $Z_{i}$  was a sparse matrix, where each row contained a single $1$ to indicate the unique address' intercept. Now each *unit* has its own intercept to account for its baseline rent determined by address, and its own intercept for the number of bedrooms (as a numeric variable). Again we can think of this intuitively: the rate at which the number of bedrooms effects rent depends on the address of the unit. If a rental property is in a posh, expensive neighborhood, then adding an additional bedroom will have a much greater effect on rent than if we tacked on an additional bedroom in a less-expensive area. 
+
+The final mixed effect model we employ is a nested model, where we nest `Address` within `Zipcode`. This means each level of address occurs with one and only one level of zipcode; this is the definition of a nested model. Note that a nested model requires repeated measurements of the smallest (nested) variable; here we have multiple units within a single address as our repeated measurement. Therefore, the nested model indicates that each zipcode will have its own baseline rent, and within each respective zipcode, each address will have its own baseline rent. The individual unit rents will be influenced by these baseline rates determined by location within Boston.
+
+The model is written as such:
+
+$$ Y_{ijk} = \mathbf{X_{ijk}}\beta + b_{i} + b_{ij} +  \epsilon_{ijk}$$
+where $i$ indexes the number of zipcodes, $j$ indexes the number of addresses within zipcode $i$, and $k$ indexes the number of units within address $i$ in zipcode $j$. 
+
+In R, we indicate a nested model with the term: `+ (1|Zipcode/Address)`, which is equivalent to `(1|Zipcode) + (1|Zipcode:Address)`. Therefore, the nested model actually has two random intercepts: one for `Zipcode` only and one for the interaction between `Zipcode` and `Address`. Compare this with the random intercept and slope model: the nested model contains an additional intercept term. The first intercept $b_{i}$ is only indexed by zipcode and is thus the `(1|Zipcode)` component of the model. The second intercept $b_{ij}$ is indexed by zipcode and address, and is the `(1|Zipcode:Address)` component of the model. 
+
+The model matrices for random effects $Z_{i}$ and $Z_{ij}$ correspond to $b_{i}$ and $b_{ij}$ respectively. As in the random intercept model, $Z_{i}$ and $Z_{ij}$ are each a sparse matrix where each row contained a single $1$ to indicate the unique zipcode and zipcode/address interaction intercept. We can thus think of them each as a vector of $1$s, and do not note them in the above model equation. 
+
+
+## Kriging ##
+
+Finally, we attempt Kriging, a method to interpolate a measurement based on the values of surrounding points. Our intuition is to incorporate the influence of latitude and longitude to rental prices, but not directly as a linear relationship as seen in a linear regression model. Kriging predicts the new measurement by calculating a weighted average of neighbor points, so we will get the most optimal predictions if the interpolation areas are dense and uniformly distributed. We also need to make sure that our data locations do not fall in clusters with large gap because this will lead to unreliable estimates. We address these requirements by limiting the interpolation areas within seven miles radius of Copley Square. Next, we jitter all pairs of latitude and longitude for multi-unit addresses because Kriging only allows unique data locations. Naturally, we only need the data locations to predict rental prices using Kriging. To improve predictive power, we can also include in Kriging model some fixed effects and random effects, as long as the effects do not have spatial component. Since our linear mixed models use `Address` as a random effect, it creates redundancy if we are to combine Kriging with these models. In the end, we choose to only combine the fixed effects that are proven predictive in previous models to this Kriging model.
+
+## Subset: Boston Proper ##
+
+On our first round of modeling, we look at all of the data we have received. On our second round, we zoom in to only look at those closest to downtown Boston, which we define as being within a four mile radius of Copley Square.
+
+# Results #
+
+## Summary Statistics ##
+
+Below are the results on our test set for all of the data.
+
+```{r echo=FALSE}
+kable(metrics.dat, row.names=TRUE)
+```
+
+Next find the results for our subset of data closest to Copley Square.
+
+```{r echo=FALSE}
+kable(metrics.dat_bos, row.names=TRUE)
+```
+
+## Visualization ##
+
+Below, please find the visualization of kriging for the model based on all of the properties. This is based off of a two bedroom, one thousand square footage apartment without utilities being paid.
+
+![Rents in Boston, Full Data Model: 2 Bedroom, 1000 Sq Ft Apartment](full_data_krig.png)
+
+```{r echo=FALSE, eval=FALSE}
+### make raster image for heatmap ###
+# latitude values for predicting
+num_points <- 200
+# go from min latitude observed to max, and make 1000 data points
+x <- seq(min(data_bos$Latitude, na.rm=T), max(data_bos$Latitude, na.rm=T), length.out=num_points)
+# longitude values for predicting
+# go from min longitude observed to max, and make 1000 data points
+y <- seq(min(data_bos$Longitude, na.rm=T), max(data_bos$Longitude, na.rm=T), length.out=num_points)
+# make latitude values into matrix
+X = matrix(rep(x, each = num_points), nrow = num_points)
+# make longitude values into matrix
+Y = matrix(rep(y, num_points), nrow = num_points)
+
+# make latitude and longitude matrices into data frame
+points = data.frame(Longitude = c(Y), Latitude = c(X))
+# add predictor values
+# initialize bedrooms as 1
+points$Num.Bedrooms <- 2
+# initialize towns as other
+# points$Town <- 'Other'
+# initialize as aparments, not houses
+points$Apt.or.House <- 'Apartment'
+# initialize as no utilities included
+points$Utilities.Included <- 'NO'
+# initialize to mean squarefootage of one bedroom apartments
+points$SqFt <- 1000 #mean((data %>% filter(Num.Bedrooms=='1'))$SqFt, na.rm=T)
+# initialize state to MA
+# points$State <- 'MA'#ifelse(points$Latitude < 42.7, 'MA', 'NH')
+# initialize to not single units
+# points$single_unit <- 0
+# initialize to blank string for address
+# points$Address <- ''
+# initialize to blank string for zip code
+# points$Zipcode <- '02139'
+# calculate predicted rent for this new data
+points$pred_rent <- predict_krig(train=krig.train, test=points, fit=fit.rent)$predictions
+points <- as.data.frame(points)
+# create raster grid
+s <- SpatialPixelsDataFrame(points[,c('Longitude', 'Latitude')], data = points)
+# set WGS84 projection
+crs(s) <- sp::CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+# set WGS84 projection
+r <- raster(s)
+# reset values to be predicted rent
+values(r) <- matrix(points$pred_rent, nrow(r), ncol(r), byrow = TRUE)
+colorpal_hm <- colorNumeric(palette="Spectral", domain=range(values(r)), reverse=TRUE)
+leaflet(data=r) %>%
+  addTiles() %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>%
+  addRasterImage(r, colors=colorpal_hm, opacity = 0.6) %>%
+  addLegend('bottomleft', pal=colorpal_hm, values=values(r), title='Predicted Rent Price')
+```
+
+Below, please find the visualization of kriging for the model based on those properties closest to downtown Boston. This is based off of a two bedroom, one thousand square footage apartment without utilities being paid.
+
+![Rents in Boston, Downtown Boston Model: 2 Bedroom, 1000 Sq Ft Apartment](bos_data_krig.png)
+
+```{r echo=FALSE, eval=FALSE}
+### make raster image for heatmap ###
+# latitude values for predicting
+num_points <- 200
+# go from min latitude observed to max, and make 1000 data points
+x <- seq(min(data_bos$Latitude, na.rm=T), max(data_bos$Latitude, na.rm=T), length.out=num_points)
+# longitude values for predicting
+# go from min longitude observed to max, and make 1000 data points
+y <- seq(min(data_bos$Longitude, na.rm=T), max(data_bos$Longitude, na.rm=T), length.out=num_points)
+# make latitude values into matrix
+X = matrix(rep(x, each = num_points), nrow = num_points)
+# make longitude values into matrix
+Y = matrix(rep(y, num_points), nrow = num_points)
+
+# make latitude and longitude matrices into data frame
+points = data.frame(Longitude = c(Y), Latitude = c(X))
+# add predictor values
+# initialize bedrooms as 1
+points$Num.Bedrooms <- 2
+# initialize towns as other
+# points$Town <- 'Other'
+# initialize as aparments, not houses
+points$Apt.or.House <- 'Apartment'
+# initialize as no utilities included
+points$Utilities.Included <- 'NO'
+# initialize to mean squarefootage of one bedroom apartments
+points$SqFt <- 1000 #mean((data %>% filter(Num.Bedrooms=='1'))$SqFt, na.rm=T)
+# initialize state to MA
+# points$State <- 'MA'#ifelse(points$Latitude < 42.7, 'MA', 'NH')
+# initialize to not single units
+# points$single_unit <- 0
+# initialize to blank string for address
+# points$Address <- ''
+# initialize to blank string for zip code
+# points$Zipcode <- '02139'
+# calculate predicted rent for this new data
+points$pred_rent <- predict_krig(train=krig.train_bos, test=points, fit=fit.rent_bos)$predictions
+points <- as.data.frame(points)
+# create raster grid
+s <- SpatialPixelsDataFrame(points[,c('Longitude', 'Latitude')], data = points)
+# set WGS84 projection
+crs(s) <- sp::CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+# set WGS84 projection
+r <- raster(s)
+# reset values to be predicted rent
+values(r) <- matrix(points$pred_rent, nrow(r), ncol(r), byrow = TRUE)
+colorpal_hm <- colorNumeric(palette="Spectral", domain=range(values(r)), reverse=TRUE)      
+leaflet(data=r) %>% 
+  addTiles() %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>%
+  addRasterImage(r, colors=colorpal_hm, opacity = 0.6) %>% 
+  addLegend('bottomleft', pal=colorpal_hm, values=values(r), title='Predicted Rent Price')
+```
+
+# Conclusions #
+
+*Updated Conclusion:*
+For all three measures of model performance, the linear mixed effects model with address as random intercept and number of bedrooms as random slope is the winner for the full dataset. This is acceptable to intuition: you might think of rent as having some baseline determined by location or quality of a complex, while the contribution of a single additional bedroom to rent price might be much greater for a unit in Cambridge than in Somerville. Interestingly, the nested model has a very similar performance as the random intercept only model. Recall the nested model is essentially a mixed effects model with multiple random intercepts. Therefore, it is not surprising the nested model still underperforms compared to the mixed effects model that contains a random slope term. 
+
+*Previous Conclusion: delete once have checked over new conc*
+If RMSE is the criterion of interest, then the linear mixed effects model with address as random intercept and number of bedrooms as random slope is the winner for the full dataset. This is acceptable to intuition: you might think of rent as having some baseline determined by location or quality of a complex, while the contribution of a single additional bedroom to rent price might be much greater for a unit in Cambridge than in Somerville. Interestingly, the nested model performed well according to AIC and variance of error. Recall that the nested model nested square footage, not number of bedrooms, within address. This, too, seems like a variable that would be significantly more or less important in accordance with desirability of the real estate.
+
+*This is good to go:*
+Looking now at the modeling results for data nearest Copley Square, we find kriging to be the winner for RMSE. Our hope was that kriging would perform nicely in a densely populated area, and this turned out to be the case. However, the mixed effects model with a random intercept and random slope still takes the cake for AIC and variance of error.
+
+# Appendices #
+
+Please see the full code appendix below.
+
+```{r warning=F, message=F}
+# Take a peek of the data set
+
+head(data)
+```
