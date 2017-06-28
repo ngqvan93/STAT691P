@@ -677,13 +677,3 @@ leaflet(data=r) %>%
 For all three measures of model performance, the linear mixed effects model with address as random intercept and number of bedrooms as random slope is the winner for the full dataset. This is acceptable to intuition: you might think of rent as having some baseline determined by location or quality of a complex, while the contribution of a single additional bedroom to rent price might be much greater for a unit in Cambridge than in Somerville. Interestingly, the nested model has a very similar performance as the random intercept only model. Recall the nested model is essentially a mixed effects model with multiple random intercepts. Therefore, it is not surprising the nested model still underperforms compared to the mixed effects model that contains a random slope term. 
 
 Looking now at the modeling results for data nearest Copley Square, we find kriging to be the winner for RMSE. Our hope was that kriging would perform nicely in a densely populated area, and this turned out to be the case. However, the mixed effects model with a random intercept and random slope still takes the cake for AIC and variance of error.
-
-# Appendices #
-
-Please see the full code appendix below.
-
-```{r warning=F, message=F}
-# Take a peek of the data set
-
-head(data)
-```
